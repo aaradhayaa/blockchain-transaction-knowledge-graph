@@ -1,49 +1,278 @@
 from pathlib import Path
-
 import pandas as pd
-import networkx as nx
 
 
-# Project paths
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_PATH = PROJECT_ROOT / "data" / "raw" / "AddrAddr_edgelist.csv"
-OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "bitcoin_graph.graphml"
+# ============================================================
+# Paths
+# ============================================================
 
+RAW = Path("data/raw")
+PROCESSED = Path("data/processed")
+
+PROCESSED.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# Helper function
+# ============================================================
+
+def add_triples(
+    triples,
+    source_file,
+    head_column,
+    relation,
+    tail_column
+):
+    """
+    Read an edge file in chunks and add its relationships
+    to the KG as (head, relation, tail) triples.
+    """
+
+    print(f"\nReading {source_file.name}...")
+
+    rows_read = 0
+
+    for chunk in pd.read_csv(
+        source_file,
+        usecols=[head_column, tail_column],
+        chunksize=100_000
+    ):
+
+        chunk = chunk.dropna(
+            subset=[head_column, tail_column]
+        )
+
+        for head, tail in zip(
+            chunk[head_column],
+            chunk[tail_column]
+        ):
+            triples.append(
+                (
+                    str(head),
+                    relation,
+                    str(tail)
+                )
+            )
+
+        rows_read += len(chunk)
+
+    print(f"  Rows processed: {rows_read:,}")
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-    print("Loading Bitcoin address interactions...")
 
-    # Load address-to-address edges
-    edges = pd.read_csv(DATA_PATH)
+    print("=" * 70)
+    print("BUILDING BITCOIN KNOWLEDGE GRAPH")
+    print("=" * 70)
 
-    # Remove duplicate edges
-    edges = edges.drop_duplicates()
+    triples = []
 
-    # Remove self-loops
-    edges = edges[edges["input_address"] != edges["output_address"]]
+    # --------------------------------------------------------
+    # 1. Wallet -> Transaction
+    # --------------------------------------------------------
 
-    print(f"Cleaned edge list: {len(edges):,} edges")
-
-    # Build a directed graph
-    graph = nx.from_pandas_edgelist(
-        edges,
-        source="input_address",
-        target="output_address",
-        create_using=nx.DiGraph()
+    add_triples(
+        triples=triples,
+        source_file=RAW / "AddrTx_edgelist.csv",
+        head_column="input_address",
+        relation="participates_in",
+        tail_column="txId"
     )
 
-    # Graph statistics
-    print("\nKnowledge Graph Statistics")
-    print("--------------------------")
-    print(f"Nodes: {graph.number_of_nodes():,}")
-    print(f"Edges: {graph.number_of_edges():,}")
-    print(f"Weakly connected components: {nx.number_weakly_connected_components(graph):,}")
+    # --------------------------------------------------------
+    # 2. Transaction -> Wallet
+    # --------------------------------------------------------
 
-    # Save graph
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    nx.write_graphml(graph, OUTPUT_PATH)
+    add_triples(
+        triples=triples,
+        source_file=RAW / "TxAddr_edgelist.csv",
+        head_column="txId",
+        relation="has_output",
+        tail_column="output_address"
+    )
 
-    print(f"\nGraph saved to: {OUTPUT_PATH}")
+    # --------------------------------------------------------
+    # 3. Transaction -> Transaction
+    # --------------------------------------------------------
+
+    add_triples(
+        triples=triples,
+        source_file=RAW / "txs_edgelist.csv",
+        head_column="txId1",
+        relation="money_flows_to",
+        tail_column="txId2"
+    )
+
+    # --------------------------------------------------------
+    # Convert to DataFrame
+    # --------------------------------------------------------
+
+    print("\nCreating triple table...")
+
+    kg = pd.DataFrame(
+        triples,
+        columns=["head", "relation", "tail"]
+    )
+
+    print(f"Raw triples: {len(kg):,}")
+
+    # --------------------------------------------------------
+    # Remove duplicate triples
+    # --------------------------------------------------------
+
+    before = len(kg)
+
+    kg = kg.drop_duplicates(
+        subset=["head", "relation", "tail"]
+    ).reset_index(drop=True)
+
+    duplicates_removed = before - len(kg)
+
+    print(f"Duplicate triples removed: {duplicates_removed:,}")
+    print(f"Final triples: {len(kg):,}")
+
+    # --------------------------------------------------------
+    # Basic validation
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("VALIDATION")
+    print("=" * 70)
+
+    print("\nTriples by relation:")
+
+    relation_counts = (
+        kg["relation"]
+        .value_counts()
+        .sort_index()
+    )
+
+    print(relation_counts.to_string())
+
+    print("\nUnique entities:")
+
+    entities = set(kg["head"]) | set(kg["tail"])
+
+    print(f"Total unique entities: {len(entities):,}")
+
+    # Identify entities by their occurrence in each relation
+    wallet_nodes = set(
+        kg.loc[
+            kg["relation"] == "participates_in",
+            "head"
+        ]
+    )
+
+    transaction_nodes = set(
+        kg.loc[
+            kg["relation"] == "participates_in",
+            "tail"
+        ]
+    )
+
+    transaction_nodes.update(
+        kg.loc[
+            kg["relation"] == "money_flows_to",
+            "head"
+        ]
+    )
+
+    transaction_nodes.update(
+        kg.loc[
+            kg["relation"] == "money_flows_to",
+            "tail"
+        ]
+    )
+
+    print(f"Wallet entities: {len(wallet_nodes):,}")
+    print(f"Transaction entities: {len(transaction_nodes):,}")
+
+    # --------------------------------------------------------
+    # Check transaction consistency
+    # --------------------------------------------------------
+
+    print("\nChecking transaction relationships...")
+
+    money_flow_transactions = set(
+        kg.loc[
+            kg["relation"] == "money_flows_to",
+            "head"
+        ]
+    )
+
+    money_flow_transactions.update(
+        kg.loc[
+            kg["relation"] == "money_flows_to",
+            "tail"
+        ]
+    )
+
+    wallet_transaction_ids = set(
+        kg.loc[
+            kg["relation"] == "participates_in",
+            "tail"
+        ]
+    )
+
+    wallet_transaction_ids.update(
+        kg.loc[
+            kg["relation"] == "has_output",
+            "head"
+        ]
+    )
+
+    overlap = (
+        money_flow_transactions
+        & wallet_transaction_ids
+    )
+
+    transaction_only = (
+        money_flow_transactions
+        - wallet_transaction_ids
+    )
+
+    print(
+        "Transactions appearing in both "
+        f"wallet and money-flow relationships: {len(overlap):,}"
+    )
+
+    print(
+        "Transactions appearing only in "
+        f"money-flow relationships: {len(transaction_only):,}"
+    )
+
+    # --------------------------------------------------------
+    # Save KG
+    # --------------------------------------------------------
+
+    output = (
+        PROCESSED
+        / "knowledge_graph_triples.csv"
+    )
+
+    kg.to_csv(
+        output,
+        index=False
+    )
+
+    print("\n" + "=" * 70)
+    print("KNOWLEDGE GRAPH CREATED")
+    print("=" * 70)
+
+    print(f"\nSaved to:")
+    print(output)
+
+    print(f"\nFinal triples: {len(kg):,}")
+    print(f"Unique entities: {len(entities):,}")
+
+    print("\nFirst 10 triples:")
+    print(
+        kg.head(10).to_string(index=False)
+    )
 
 
 if __name__ == "__main__":

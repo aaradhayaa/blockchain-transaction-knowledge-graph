@@ -29,3 +29,7 @@ Thumbs.db
 # Generated results
 results/figures/
 results/tables/
+
+# Generated visualization files
+results/
+lib/
