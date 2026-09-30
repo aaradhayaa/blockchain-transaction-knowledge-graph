@@ -1,154 +1,188 @@
+"""
+Prepare the transaction-level Knowledge Graph for link prediction.
+
+Final experiment:
+    Transaction --money_flows_to--> Transaction
+
+Input:
+    data/raw/txs_edgelist.csv
+
+Output:
+    data/processed/link_prediction/all_triples.tsv
+
+The output contains exactly three columns:
+    subject    relation    object
+
+No transaction labels or features are included because they are not
+part of the link-prediction input graph.
+"""
+
 from pathlib import Path
-
 import pandas as pd
-from tqdm import tqdm
 
 
-# --------------------------------------------------
-# 1. Set project paths
-# --------------------------------------------------
+# -------------------------------------------------------------------
+# Paths
+# -------------------------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-RAW_DIR = PROJECT_ROOT / "data" / "raw"
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+INPUT_FILE = Path("data/raw/txs_edgelist.csv")
+OUTPUT_DIR = Path("data/processed/link_prediction")
+OUTPUT_FILE = OUTPUT_DIR / "all_triples.tsv"
 
 
-# --------------------------------------------------
-# 2. Helper function to create triples
-# --------------------------------------------------
+# -------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------
 
-def create_triples(
-    df,
-    head_column,
-    relation,
-    tail_column,
-):
-    """
-    Convert an edge dataframe into KG triples:
-    (head, relation, tail)
-    """
+RELATION = "money_flows_to"
 
-    triples = pd.DataFrame(
-        {
-            "head": df[head_column].astype(str),
-            "relation": relation,
-            "tail": df[tail_column].astype(str),
-        }
+
+# -------------------------------------------------------------------
+# Main
+# -------------------------------------------------------------------
+
+def main():
+
+    print("=" * 70)
+    print("PREPARING TRANSACTION LINK-PREDICTION TRIPLES")
+    print("=" * 70)
+
+    if not INPUT_FILE.exists():
+        raise FileNotFoundError(
+            f"Could not find input file: {INPUT_FILE}"
+        )
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ---------------------------------------------------------------
+    # Load
+    # ---------------------------------------------------------------
+
+    print(f"\nLoading: {INPUT_FILE}")
+
+    df = pd.read_csv(
+        INPUT_FILE,
+        dtype=str
     )
 
-    # Remove duplicate relationships
-    triples = triples.drop_duplicates()
+    expected_columns = {"txId1", "txId2"}
+
+    if not expected_columns.issubset(df.columns):
+        raise ValueError(
+            f"Expected columns {expected_columns}, "
+            f"but found {list(df.columns)}"
+        )
+
+    print(f"Input edges: {len(df):,}")
+
+    # ---------------------------------------------------------------
+    # Clean
+    # ---------------------------------------------------------------
+
+    df = df[["txId1", "txId2"]].copy()
+
+    df["txId1"] = df["txId1"].str.strip()
+    df["txId2"] = df["txId2"].str.strip()
+
+    # Remove missing IDs
+    before = len(df)
+
+    df = df.dropna(subset=["txId1", "txId2"])
+
+    print(
+        f"Removed missing-ID rows: "
+        f"{before - len(df):,}"
+    )
+
+    # Remove empty IDs
+    before = len(df)
+
+    df = df[
+        (df["txId1"] != "") &
+        (df["txId2"] != "")
+    ]
+
+    print(
+        f"Removed empty-ID rows: "
+        f"{before - len(df):,}"
+    )
 
     # Remove self-loops
-    triples = triples[triples["head"] != triples["tail"]]
+    before = len(df)
 
-    return triples
+    df = df[df["txId1"] != df["txId2"]]
 
+    print(
+        f"Removed self-loops: "
+        f"{before - len(df):,}"
+    )
 
-# --------------------------------------------------
-# 3. Load wallet-to-wallet relationships
-# --------------------------------------------------
+    # Remove exact duplicate edges
+    before = len(df)
 
-print("Loading wallet-to-wallet edges...")
+    df = df.drop_duplicates(
+        subset=["txId1", "txId2"]
+    )
 
-addr_addr = pd.read_csv(
-    RAW_DIR / "AddrAddr_edgelist.csv",
-    dtype=str,
-)
+    print(
+        f"Removed duplicate edges: "
+        f"{before - len(df):,}"
+    )
 
-wallet_triples = create_triples(
-    addr_addr,
-    head_column="input_address",
-    relation="transacted_with",
-    tail_column="output_address",
-)
+    # ---------------------------------------------------------------
+    # Convert to KG triples
+    # ---------------------------------------------------------------
 
-print(f"Wallet-to-wallet triples: {len(wallet_triples):,}")
+    triples = pd.DataFrame({
+        "subject": df["txId1"],
+        "relation": RELATION,
+        "object": df["txId2"],
+    })
 
+    # ---------------------------------------------------------------
+    # Statistics
+    # ---------------------------------------------------------------
 
-# --------------------------------------------------
-# 4. Load wallet-to-transaction relationships
-# --------------------------------------------------
+    entities = set(triples["subject"]) | set(triples["object"])
 
-print("Loading wallet-to-transaction edges...")
+    print("\n" + "=" * 70)
+    print("FINAL TRANSACTION KG")
+    print("=" * 70)
 
-addr_tx = pd.read_csv(
-    RAW_DIR / "AddrTx_edgelist.csv",
-    dtype=str,
-)
+    print(f"Entities: {len(entities):,}")
+    print(f"Relations: 1")
+    print(f"Triples: {len(triples):,}")
+    print(f"Relation: {RELATION}")
 
-wallet_transaction_triples = create_triples(
-    addr_tx,
-    head_column="input_address",
-    relation="participates_in",
-    tail_column="txId",
-)
+    print("\nThis KG contains:")
+    print("  Transaction -> money_flows_to -> Transaction")
 
-print(
-    "Wallet-to-transaction triples: "
-    f"{len(wallet_transaction_triples):,}"
-)
+    print("\nExcluded from the embedding experiment:")
+    print("  Wallet relations")
+    print("  has_output")
+    print("  AddrAddr")
+    print("  Transaction features")
+    print("  Transaction classes")
 
+    # ---------------------------------------------------------------
+    # Save
+    # ---------------------------------------------------------------
 
-# --------------------------------------------------
-# 5. Load transaction-to-wallet relationships
-# --------------------------------------------------
+    # PyKEEN-compatible TSV: no header.
+    triples.to_csv(
+        OUTPUT_FILE,
+        sep="\t",
+        index=False,
+        header=False
+    )
 
-print("Loading transaction-to-wallet edges...")
+    print(f"\nSaved:")
+    print(f"  {OUTPUT_FILE}")
 
-tx_addr = pd.read_csv(
-    RAW_DIR / "TxAddr_edgelist.csv",
-    dtype=str,
-)
-
-transaction_wallet_triples = create_triples(
-    tx_addr,
-    head_column="txId",
-    relation="has_output",
-    tail_column="output_address",
-)
-
-print(
-    "Transaction-to-wallet triples: "
-    f"{len(transaction_wallet_triples):,}"
-)
-
-
-# --------------------------------------------------
-# 6. Combine all relationships
-# --------------------------------------------------
-
-print("\nCombining triples...")
-
-all_triples = pd.concat(
-    [
-        wallet_triples,
-        wallet_transaction_triples,
-        transaction_wallet_triples,
-    ],
-    ignore_index=True,
-)
-
-# Remove duplicate triples across the combined dataset
-all_triples = all_triples.drop_duplicates()
-
-# Save the complete KG triple dataset
-output_path = PROCESSED_DIR / "bitcoin_triples_full.csv"
-
-all_triples.to_csv(output_path, index=False)
+    print("\n" + "=" * 70)
+    print("PREPARATION COMPLETE")
+    print("=" * 70)
 
 
-# --------------------------------------------------
-# 7. Print summary
-# --------------------------------------------------
-
-print("\nKnowledge graph triple dataset created!")
-
-print(f"Total triples: {len(all_triples):,}")
-
-print("\nTriples by relationship:")
-print(all_triples["relation"].value_counts())
-
-print(f"\nSaved to: {output_path}")
+if __name__ == "__main__":
+    main()
